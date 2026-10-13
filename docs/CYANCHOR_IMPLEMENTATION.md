@@ -1,0 +1,516 @@
+# CyANCHOR — Implementation Reference
+
+CyANCHOR is this project's text-to-Cypher **value-grounding** method: a
+deterministic *plan → execute → generate* grounder with LLM-guided corrective
+loops, plus two post-generation safety guards. It is the paper's contribution
+and the only method that gets optimized (the other four — `no_val_link`,
+`fcav`, `react`, `graphrag` — are baselines and are held fixed).
+
+This document traces the actual code path end to end. Unless noted, file
+references are `plan_exec.py` (the grounder) and `ner_agent_auto.py` (the
+orchestrator that calls it).
+
+> Naming note: the method is **CyANCHOR** externally, but the code still calls
+> it `plan_exec`. `mode` strings like `cyanchor_fl_node_rel` and the legacy
+> `plan_exec_*` both dispatch here ([ner_agent_auto.py:131](../ner_agent_auto.py#L131)).
+
+### Component names — paper ↔ code
+
+The paper names the five ablated components differently from the code. Each component
+has one **switch**. The switch name is the identifier: the worker reads it, a run records
+it in `summary.json` (`run_config.knobs`), `scripts/audit_runs.py` compares it, and the
+ablation cells are named after it — so runs made before the paper names existed stay
+comparable. The paper's name is an **alias** of the switch
+([component_names.py](../component_names.py)):
+
+- the `eval_config.py` panel is written with the aliases, and a driver or script may read
+  or assign either name — `cfg.ADAPTIVE_SEARCH_CONTROL` and `cfg.PLAN_EXEC_ESCALATE` are one
+  attribute;
+- the bare CLI reads either environment variable ([config.py](../config.py));
+- `run_ablation_model.py --variants` accepts a cell's alias, and the ablation reports
+  (`scripts/tuning/score_ablation.py`) print the paper names.
+
+Setting a switch and its alias to different values is an error. This document uses the
+code names.
+
+| Paper name | Alias (panel, environment) | Switch (recorded in `summary.json`) | Code name in this document | Ablation cell that removes it (`--variants` alias) | Section |
+|---|---|---|---|---|---|
+| Adaptive Search Control | `ADAPTIVE_SEARCH_CONTROL` | `PLAN_EXEC_ESCALATE` | corrective escalation loop | `no_escalate` (`no_adaptive_search_control`) | §5c |
+| Token Level Fuzzy Match | `TOKEN_LEVEL_FUZZY_MATCH` | `RETRIEVAL_FUZZY` | fuzzy arm | `lev_only` (`no_token_level_fuzzy_match`) | §5b |
+| Levenshtein Retrieval | `LEVENSHTEIN_RETRIEVAL` | `RETRIEVAL_LEVENSHTEIN` | Levenshtein arm | `fuzzy_only` (`no_levenshtein_retrieval`) | §5b |
+| Result Aware Query Repair | `RESULT_AWARE_QUERY_REPAIR` | `CYPHER_SEMANTIC_REPAIR` | semantic repair | `no_semantic_repair` (`no_result_aware_query_repair`) | §7 |
+| Value Existence Guard | `VALUE_EXISTENCE_GUARD` | `PLAN_EXEC_VALUE_SNAP` | value-snap guard | `no_value_snap` (`no_value_existence_guard`) | §8 |
+
+The two retrieval cells are named after the arm that stays on, not the one removed:
+`fuzzy_only` removes Levenshtein Retrieval, `lev_only` removes Token Level Fuzzy Match.
+A cell's directory keeps the cell name whichever name was typed.
+
+Not rows of the ablation table: the select-or-abstain judge (`PLAN_EXEC_SELECT_JUDGE`,
+§5d; the paper's candidate selection and abstention step), on in the released
+configuration; relation tools (`CYANCHOR_TOOL_SCOPE = node_rel`) and the vector arm
+(`RETRIEVAL_VECTOR`), both off.
+
+---
+
+## 1. Where it lives
+
+| Concern | Location |
+|---|---|
+| Grounder (PLAN/EXECUTE/GENERATE, value-snap) | [plan_exec.py](../plan_exec.py) |
+| Orchestration, Cypher gen, retry + semantic repair | [ner_agent_auto.py](../ner_agent_auto.py) `ask_auto` |
+| Per-(label,property) search tools (auto-generated) | [generated/generated_node_tools.py](../generated/generated_node_tools.py), [generated/generated_rel_tools.py](../generated/generated_rel_tools.py) |
+| Tool routing (FAISS over tool descriptions) | [tools/tool_search.py](../tools/tool_search.py) |
+| Retrieval primitives (fuzzy / vector / Levenshtein) | [neo4j_lib/neo4j_search.py](../neo4j_lib/neo4j_search.py) |
+| Semantic evaluator (reused read-only from graphrag) | [graphrag.py](../graphrag.py) `_evaluate_semantics` |
+| Config knobs | [config.py](../config.py) |
+
+---
+
+## 2. Configuration surface
+
+CyANCHOR's behavior is fully described by a `GroundingSpec`
+([config.py:303](../config.py#L303)) resolved from `METHOD=cyanchor` plus these knobs
+(a name in parentheses is the switch's alias, the name the `eval_config.py` panel uses):
+
+**Retrieval arms** (≥1 must be on; unioned per field):
+
+| Knob | Default | Arm |
+|---|---|---|
+| `RETRIEVAL_FUZZY` (`TOKEN_LEVEL_FUZZY_MATCH`) | on | per-token fuzzy match on the Lucene full-text index, BM25-ranked |
+| `RETRIEVAL_VECTOR` | off | in-graph embedding kNN (needs embeddings; the `hybrid` flag) |
+| `RETRIEVAL_LEVENSHTEIN` (`LEVENSHTEIN_RETRIEVAL`) | on | APOC normalized edit-distance scan |
+
+**Tool scope**: `CYANCHOR_TOOL_SCOPE = node | node_rel` (released `node`, relation tools off; the ReAct baseline's `TOOL_TYPE` is `node` as well, so both tool-using methods ground over the same node-property tools). Relation tools add a relation-pattern hint that duplicates the schema in the prompt and never perform value retrieval in CyANCHOR (`_retrieve_values` searches node properties only); ablated to zero contribution on 5 graphs / 2 backbones.
+
+**Corrective escalation** ([config.py:426-447](../config.py#L426)):
+
+| Knob | Default | Meaning |
+|---|---|---|
+| `PLAN_EXEC_TOOLS_PER_ENTITY` | 2 | fields searched in the initial retrieval |
+| `PLAN_EXEC_VALUES_PER_TOOL` | 10 | top-K values per field (fuzzy) |
+| `PLAN_EXEC_HYBRID_FUZZY_K` / `_VECTOR_K` | 10 / 5 | per-arm K when vector arm is on |
+| `RETRIEVAL_LEVENSHTEIN_K` | 10 | candidates from the Levenshtein arm |
+| `PLAN_EXEC_ESCALATE` (`ADAPTIVE_SEARCH_CONTROL`) | on | enable the corrective LLM-judge loop |
+| `PLAN_EXEC_MAX_ITER` | 3 | max escalation rounds per mention |
+| `PLAN_EXEC_ESCALATE_BUDGET` | (5,3,1) | extra values per successive `value` round |
+| `PLAN_EXEC_SKIP_GROUNDED` | on | skip escalation when already cleanly grounded |
+| `PLAN_EXEC_PARALLEL_MENTIONS` | on | run mentions concurrently |
+
+**Semantic repair** ([config.py:520-522](../config.py#L520), CyANCHOR-only):
+
+| Knob | Default | Meaning |
+|---|---|---|
+| `CYPHER_SEMANTIC_REPAIR` (`RESULT_AWARE_QUERY_REPAIR`) | on | enable result-evaluate → regenerate loop |
+| `CYPHER_REPAIR_MAX_ROUNDS` | 4 | round budget when semantic repair is on |
+| `CYPHER_EMPTY_IS_WRONG` | **off** (since 2026-09) | treat a 0-row result as a defect — ablated to zero contribution on 4 graphs, see `report/tuning_summary.md` |
+| `CYPHER_RETRY_MAX_ROUNDS` | 2 | error-only retry budget (react baseline + repair-off) |
+| `PLAN_EXEC_VALUE_SNAP` (`VALUE_EXISTENCE_GUARD`) | on | post-generation existence-gated snap guard |
+
+---
+
+## 3. End-to-end pipeline
+
+```
+ask_auto(question, mode="cyanchor_…")          ner_agent_auto.py
+        │
+        ▼
+┌─────────────────────────────────────────────────────────┐
+│ get_plan_exec_evidence()           plan_exec.py:724       │
+│                                                           │
+│  ① PLAN     plan_entities()  ── 1 LLM call ──►            │
+│             [{mention, kind, descriptor}, …]              │
+│                                                           │
+│  ② EXECUTE  execute_entity()  per mention (parallel):     │
+│       a. route descriptor → top-2 fields  (FAISS)         │
+│       b. initial retrieval = fuzzy ∪ vector ∪ Levenshtein │
+│       c. corrective escalation loop (≤3 rounds, LLM judge)│
+│       d. select-or-abstain judge (select one / abstain)   │
+│                                                           │
+│  ③ build_injection() → {relevant_entities} block          │
+└─────────────────────────────────────────────────────────┘
+        │  injection block + structured evidence
+        ▼
+┌─────────────────────────────────────────────────────────┐
+│ ④ Cypher generation                ner_agent_auto.py:1645 │
+│    filled = shared system prompt                          │
+│           + injection block                               │
+│           + _UNION_GUIDANCE (fair, all modes)             │
+│    _generate_execute_cypher_with_retry():                 │
+│       generate → execute                                  │
+│       ├─ DB error → CoT error-repair                      │
+│       └─ ok → semantic evaluate → regenerate (CyANCHOR)   │
+│       anti-oscillation: keep accepted, else 1st executable│
+└─────────────────────────────────────────────────────────┘
+        │  cypher + rows
+        ▼
+┌─────────────────────────────────────────────────────────┐
+│ ⑤ value-snap guard          plan_exec.snap_values_to_…    │
+│    existence-gated: only non-existent WHERE values        │
+│    one LLM closed-list pick → substitute → re-execute     │
+└─────────────────────────────────────────────────────────┘
+        │
+        ▼   result dict {cypher, result, context, …}
+```
+
+Stages ②b–②d run **per mention, concurrently** (thread pool sized to
+`min(#mentions, MAX_THREAD=5)`, order preserved) when
+`PLAN_EXEC_PARALLEL_MENTIONS` is on ([plan_exec.py:759-776](../plan_exec.py#L759)).
+
+---
+
+## 4. Stage ① — PLAN
+
+`plan_entities(query, llm)` ([plan_exec.py:208](../plan_exec.py#L208)) makes **one**
+LLM call decomposing the question into a list of mentions, each:
+
+```json
+{"mention": "<verbatim span>", "kind": "node" | "relation", "descriptor": "<2-5 word type>"}
+```
+
+Key prompt rules ([plan_exec.py:143-172](../plan_exec.py#L143)):
+
+- `mention` is the **verbatim surface form** — typos, casing, and abbreviations
+  are kept on purpose, because they are what the retrieval arms fuzzy-match.
+- A complete proper name stays **one** node mention (e.g. *"South African
+  Airways Flight 201"* is one node, not split on the flight number).
+- `node` = a named thing/value; `relation` = a verb/preposition phrase
+  describing how two things connect (`directed`, `departed from`).
+- `descriptor` describes the **type** (so it routes to the right tool) — it is
+  the FAISS query in the next stage, not the mention itself.
+
+`_parse_plan` ([plan_exec.py:175](../plan_exec.py#L175)) strips code fences, tolerates
+prose around the JSON array, and defaults a missing/invalid kind to `node`. A
+PLAN failure returns `[]` (the question then free-generates with no grounding).
+
+Design note: **the mention IS the search phrase** — grounding is lossless
+between stages. The verbatim span extracted here is exactly the string the
+retrieval arms will match; there is no intermediate re-extraction or
+normalization step through which a mention could be silently rewritten or
+dropped before it reaches retrieval.
+
+---
+
+## 5. Stage ② — EXECUTE
+
+`execute_entity(entity, …)` ([plan_exec.py:527](../plan_exec.py#L527)) grounds one
+mention and returns structured evidence:
+
+```python
+{"mention", "kind",
+ "candidates": [{"label", "property", "values": [...]}],
+ "patterns": ["(:A)-[:rel]->(:B)", ...]}
+```
+
+### 5a. Routing — descriptor → fields
+
+`_route_tools(descriptor, kind, …)` ([plan_exec.py:226](../plan_exec.py#L226)):
+
+1. Pick the FAISS tool index — node-only or node+rel — per `CYANCHOR_TOOL_SCOPE` (released: node-only)
+   (`_get_vectorstore(mode="react_node_only" | "react_node_rel")`).
+2. `search_tools(vs, user_query=descriptor, top_l=…)` returns ranked tool
+   `func_name`s.
+3. `_tool_meta()` ([plan_exec.py:126](../plan_exec.py#L126)) maps each `func_name` →
+   `{label, property, kind, rel_pattern, desc}` by **AST-parsing** the generated
+   tool source for its fixed `search_tool(node_label=…, property_name=…)` call
+   ([plan_exec.py:84](../plan_exec.py#L84)). Built once, cached.
+4. Tools whose `kind` matches the mention's are preferred; the list is
+   rank-ordered so the first `PLAN_EXEC_TOOLS_PER_ENTITY` (=2) drive the initial
+   retrieval and the rest form an escalation pool.
+
+For a **relation** mention, routing emits the `(:A)-[:rel]->(:B)` pattern from
+the tool docstring instead of retrieving values
+([plan_exec.py:571-573](../plan_exec.py#L571)).
+
+### 5b. Initial retrieval — the three arms
+
+`_retrieve_values(mention, label, prop, hybrid)` ([plan_exec.py:278](../plan_exec.py#L278))
+unions the enabled arms per field, deduped, insertion-ordered:
+
+1. **Fuzzy** (`RETRIEVAL_FUZZY`; paper: Token Level Fuzzy Match) —
+   `search_tool(…, mode="fuzzy")` on the field's Neo4j Lucene full-text index.
+   The mention is split into word tokens and each token gets Lucene's one-edit
+   fuzzy operator (`"Tmo Hooper"` → `Tmo~1 Hooper~1`,
+   [neo4j_search.py:141](../neo4j_lib/neo4j_search.py#L141)); a value matching
+   any token is a hit, hits are ranked by BM25, over-fetched (max(2K, 20)) and
+   re-ranked to K. Catches casing, mild typos, partial names. K =
+   `PLAN_EXEC_HYBRID_FUZZY_K` if the vector arm is on, else `PLAN_EXEC_VALUES_PER_TOOL`.
+2. **Vector** (`RETRIEVAL_VECTOR`, the `hybrid` flag) — `mode="vector"`,
+   in-graph embedding kNN. The lever for **aliases that share no characters**
+   with the canonical value. Top `PLAN_EXEC_HYBRID_VECTOR_K`. Failures are
+   swallowed (only ever adds recall).
+3. **Levenshtein** (`RETRIEVAL_LEVENSHTEIN`; paper: Levenshtein Retrieval) — `_levenshtein_fetch`
+   ([plan_exec.py:253](../plan_exec.py#L253)), a server-side
+   `apoc.text.levenshteinSimilarity` scan over the full value set, best-first.
+   Catches **char-level perturbations fuzzy misses** (abbrev codes, dense
+   typos). Handles scalar **and** array properties (e.g. `aliases`): tries the
+   scalar query, retries with `UNWIND` on a type error. Returns `[]` on any
+   failure (e.g. APOC missing), so it only adds recall.
+
+Candidate values are grouped by `(label, property)` in an insertion-ordered,
+deduped `OrderedDict`; array properties are flattened to plain strings
+(`_add`, [plan_exec.py:555](../plan_exec.py#L555)).
+
+### 5c. Corrective escalation loop
+
+Paper name: **Adaptive Search Control**.
+
+If `escalate` is on, the mention is a node, candidates exist, and the mention
+is **not** already cheaply grounded, run up to `PLAN_EXEC_MAX_ITER` (=3) rounds
+([plan_exec.py:597-621](../plan_exec.py#L597)). Each round an LLM judge
+(`_judge_step`, [plan_exec.py:491](../plan_exec.py#L491)) returns exactly one of:
+
+- **`done`** — a candidate already is the canonical value (allowing typo/casing/
+  abbrev/partial/alias), or no field could plausibly hold it → stop.
+- **`value`** — right *kind* of field but no match → **deepen** the used
+  field(s). `_escalate_fetch` ([plan_exec.py:338](../plan_exec.py#L338)) pulls
+  `depth + budget` more values (budget walks `(5,3,1)`); fuzzy mode deepens
+  fuzzy, hybrid deepens fuzzy **and** vector. Dedup keeps only the new tail.
+- **`<Label.property>`** — the mention belongs in a **different** field; the
+  judge copies one field name verbatim from a menu of available name-like node
+  fields (`_field_menu`, [plan_exec.py:454](../plan_exec.py#L454), restricted to
+  `name`/`title`/`alias`-style props, excluding already-searched ones). That
+  field gets a full initial-style fetch.
+
+Fast paths and safety: `_judge_step` returns `done` without an LLM call when a
+normalized substring already matches ([plan_exec.py:499-501](../plan_exec.py#L499)),
+and falls back to `done` on any parse/LLM error (stop rather than loop).
+`PLAN_EXEC_SKIP_GROUNDED` + `_cheap_grounded` ([plan_exec.py:360](../plan_exec.py#L360))
+skips the whole loop when a candidate already exact/substring-matches the
+mention (latency win, ~EA-neutral).
+
+### 5d. Pre-generation select-or-abstain judge
+
+> On in the released configuration (`PLAN_EXEC_SELECT_JUDGE = True`). Ablated alone it has
+> no measurable main effect: EA on four graphs (pooled p = 0.70), PSJS, the confident-wrong
+> rate (`report/judge_failure_modes.md`), and the full pole graph (1,283 paired questions,
+> 2026-09-29: +0.6 points, p = 0.46). It works on the candidates the escalation loop
+> retrieves, so the two interact: with the judge on, removing the loop costs more, because
+> the judge abstains on the shallow candidates that are left.
+
+After escalation, for a node mention that is **not** cheaply grounded (the
+abbrev / alias / misroute region), one LLM call (`_judge_select`,
+[plan_exec.py:412](../plan_exec.py#L412)) decides ([plan_exec.py:629-642](../plan_exec.py#L629)):
+
+- **`select`** → the one candidate the mention means (validated to be verbatim
+  in the list, exact then normalized match). Evidence is **filtered to that
+  single value**.
+- **`abstain`** (judge says `NONE` or names a non-listed value) → evidence is
+  **suppressed** (`by_target` emptied) so the Cypher LLM free-generates the
+  predicate from the question + schema. No forced pick, no fabricated value.
+- **`keep`** (transient failure / nothing to judge) → leave the list as-is, so a
+  flaky LLM degrades to the no-judge behavior rather than dropping grounding.
+
+Cheaply-grounded mentions skip this judge entirely (free, zero regression).
+
+---
+
+## 6. Stage ③ — GENERATE (build injection)
+
+`build_injection(evidence)` ([plan_exec.py:660](../plan_exec.py#L660)) formats the
+per-mention evidence into the `{relevant_entities}` block. It is
+**mention-grouped**, candidates kept as a best-first list (not a single resolved
+`{key: value}` dict), e.g.:
+
+```
+- "Tmo Hooper"  →  Person.name: "Tom Hooper" | "Tobe Hooper" | …
+- "directed"    →  relationship pattern: (:Person)-[:DIRECTED]->(:Movie)
+```
+
+A self-contained header ([plan_exec.py:679-688](../plan_exec.py#L679)) instructs the
+Cypher LLM that these are **suggestions, not a closed set**: use a candidate if
+one fits, ignore them and write the predicate yourself if none fits, and use
+**at most one value per mention** (overriding the template's default "use all
+pairs" framing). Empty evidence renders as `{}`.
+
+The block is injected into the shared Cypher system prompt as `{relevant_entities}`.
+
+---
+
+## 7. Stage ④ — Cypher generation, error retry, semantic repair
+
+Paper name of semantic repair: **Result Aware Query Repair**.
+
+`ask_auto` dispatches CyANCHOR (and `react`) through the **transparent manual**
+generate→execute path so the retry budget is the only variable
+([ner_agent_auto.py:1645-1664](../ner_agent_auto.py#L1645)). The Cypher prompt is:
+
+```
+shared system prompt  +  injection block  +  _UNION_GUIDANCE
+```
+
+`_UNION_GUIDANCE` ([plan_exec.py:702](../plan_exec.py#L702)) is a static,
+schema-independent block on how to structure "either A or B" disjunctions
+(COUNT inside one `CALL { … UNION … }` vs. parallel `UNION` for LISTING). For
+**fair comparison it is appended to every mode's prompt**, not just CyANCHOR's.
+
+`_generate_execute_cypher_with_retry` ([ner_agent_auto.py:1292](../ner_agent_auto.py#L1292))
+loops up to `max_rounds` (= `CYPHER_REPAIR_MAX_ROUNDS`=4 when semantic repair is
+on, else `CYPHER_RETRY_MAX_ROUNDS`=2):
+
+1. **Generate** Cypher from the (possibly correction-prefixed) prompt; clean
+   code fences.
+2. **Execute** via `execute_cypher`.
+3. **DB error** → CoT **error-repair** ([ner_agent_auto.py:1348-1361](../ner_agent_auto.py#L1348)):
+   feed back the error + failed query, ask the LLM to *first reason about the
+   error and the required structure, then rewrite*. (Used by both `react` and
+   CyANCHOR.) The doc-comment notes blind re-rolls fix ~0/12 of the UNION
+   failures, whereas one reasoned repair corrects far more per round.
+4. **Executed OK**:
+   - If semantic repair is **off** (react baseline) → accept the first
+     executable result and stop.
+   - **CyANCHOR-only semantic evaluation**: a 0-row result with
+     `CYPHER_EMPTY_IS_WRONG` is `empty`; otherwise `_evaluate_semantics`
+     ([graphrag.py:569](../graphrag.py#L569), reused read-only) classifies into
+     `accept` / `incorrect` / `illogical` / `incomplete`.
+     - `accept` → stop.
+     - otherwise → build a **grounding-aware repair header** (keeps the
+       candidate injection from `filled_prompt`, **adds** the semantic feedback +
+       a CoT request) and regenerate ([ner_agent_auto.py:1392-1418](../ner_agent_auto.py#L1392)).
+
+**Anti-oscillation** ([ner_agent_auto.py:1420-1423](../ner_agent_auto.py#L1420)): if no
+round is ever accepted, the loop returns the **first executable** attempt — so
+semantic repair can only match-or-beat the no-repair result, never regress it.
+
+This is the key difference from the `graphrag` baseline: GraphRAG does the same
+generate→execute→evaluate→repair loop but with **no pre-grounding**; CyANCHOR
+carries its retrieved candidates into every repair round.
+
+---
+
+## 8. Stage ⑤ — value-snap guard
+
+Paper name: **Value Existence Guard**.
+
+`snap_values_to_candidates` ([plan_exec.py:854](../plan_exec.py#L854), called at
+[ner_agent_auto.py:1697](../ner_agent_auto.py#L1697)) fixes the
+"retrieved-but-not-used" failure: the LLM copied the question's perturbed
+surface form into a `WHERE` clause even though the canonical value was in the
+candidate list. It is deliberately conservative:
+
+1. **Existence gate** — `_snap_value_targets` ([plan_exec.py:825](../plan_exec.py#L825))
+   extracts `(label, prop, value)` from `=` and inline-map literals **only**
+   (it skips `=~` / `CONTAINS` / `STARTS WITH` — intentional partial matches).
+   A value that **exists** in the DB (`_value_exists`) is **never touched**, so
+   correct/normal queries are safe. On any check failure it fails *safe* (treats
+   the value as existing).
+2. For each non-existent value, gather candidates: a fresh fuzzy retrieval keyed
+   on the **field the generator actually used** (robust to routing differences),
+   unioned with the per-field candidates from PLAN_EXEC's evidence.
+3. **One** LLM call (`_SNAP_SELECT_PROMPT`, [plan_exec.py:801](../plan_exec.py#L801))
+   maps each broken value → a chosen candidate (verbatim) or `NONE` — a
+   closed-list discriminative task, far more reliable than Cypher generation.
+4. Substitute only **validated** picks (must be a real candidate, not `NONE`/
+   unchanged) into the Cypher.
+5. Back in `ask_auto`, the snapped query is re-executed and **adopted only if it
+   still runs without error** ([ner_agent_auto.py:1704-1708](../ner_agent_auto.py#L1704)).
+
+---
+
+## 9. Safety / fairness properties (by construction)
+
+- **At least one retrieval arm** is required (`config` raises otherwise) — recall
+  is never zero by misconfiguration.
+- **Fail-safe everywhere**: PLAN/judge/retrieval failures degrade to "no
+  grounding" or "stop", never to a fabricated value or an infinite loop.
+- **Abstain over force**: the select judge and value-snap can only
+  pick a real candidate or decline — they cannot hallucinate a value.
+- **Monotone repair**: anti-oscillation + "adopt-only-if-still-runs" mean the
+  corrective stages can only match-or-improve the executable baseline result.
+- **Fair comparison**: every method sees the identical shared system prompt and
+  `_UNION_GUIDANCE`; CyANCHOR's only privilege is the injection block + its
+  own (CyANCHOR-gated) semantic repair / snap stages.
+
+---
+
+## 10. Ablation axes (what the paper can toggle)
+
+| Axis | Paper name | Off → On effect |
+|---|---|---|
+| `RETRIEVAL_FUZZY` | Token Level Fuzzy Match | which recall arms feed candidates |
+| `RETRIEVAL_LEVENSHTEIN` | Levenshtein Retrieval | which recall arms feed candidates |
+| `RETRIEVAL_VECTOR` | — | which recall arms feed candidates (off as shipped; the archives carry no embeddings) |
+| `PLAN_EXEC_ESCALATE` | Adaptive Search Control | static initial retrieval vs. LLM-judge corrective loop |
+| `PLAN_EXEC_SELECT_JUDGE` (**on**) | — (not an ablation row) | suppress bad groundings vs. inject all candidates — alone no measurable main effect on EA (full pole graph, 1,283 paired questions: +0.6 pts, p = 0.46) or on the confident-wrong rate (`report/judge_failure_modes.md`); interacts with the escalation loop |
+| `CYPHER_SEMANTIC_REPAIR` | Result Aware Query Repair | error-only retry vs. result-evaluate→regenerate |
+| `CYPHER_EMPTY_IS_WRONG` | — | whether 0 rows triggers repair |
+| `PLAN_EXEC_VALUE_SNAP` | Value Existence Guard | post-generation snap guard on/off |
+| `CYANCHOR_TOOL_SCOPE` | — | `node` (shipped) vs. `node_rel` routing scope |
+
+The paper's component ablation removes one of the five named components at a time from
+the released configuration. `scripts/tuning/run_ablation_model.py --model <preset> [--pole-full]`
+writes one cell per (graph, variant) under `logs/ablation_<model>__judge-on-node/`;
+`scripts/tuning/score_ablation.py --model <preset> --ref judge-on [--pole-full] --paper`
+pairs every cell per question with its graph's reference cell (two-sided sign test) and
+writes the tables to `report/` under the paper names. The cell names are in the table
+at the top of this document.
+
+Example invocations:
+
+```bash
+# CyANCHOR, all three arms, node+rel tools (NOT the shipped configuration) — in eval_config.py:
+#   METHOD = "cyanchor"; RETRIEVAL_VECTOR = True; CYANCHOR_TOOL_SCOPE = "node_rel"
+python eval_run.py
+
+# CyANCHOR, fuzzy+Levenshtein only, node-property tools (no embeddings needed) — the shipped default:
+#   METHOD = "cyanchor"; RETRIEVAL_VECTOR = False; CYANCHOR_TOOL_SCOPE = "node"
+python eval_run.py
+# (eval_run reads eval_config.py only; METHOD=… on the shell is ignored)
+
+# Single question, verbose trace
+python ner_agent_auto.py "Who directed The Matrix?" --mode cyanchor_fl_node_only --verbose
+```
+
+---
+
+## 11. Worked examples (verified against live runs, 2026-07-07)
+
+### 11a. Typo — cheap-grounded fast path (judges skipped)
+
+Question: *"How many movies did **Tmo Hooper** direct?"* (typo for *Tom Hooper*,
+CypherBench `movie` graph, config of that date `cyanchor_fl_node_rel`; the shipped config is
+`cyanchor_fl_node_only`, which drops the relation-pattern hint of step 2 — the node-mention steps
+are unchanged)
+
+1. **PLAN** → `[{"Tmo Hooper", node, "film director name"}, {"direct", relation, …}, {"movies", node, …}]`.
+2. **EXECUTE** "Tmo Hooper":
+   - route → top-2 fields `Person.name` **and** `Movie.name`.
+   - fuzzy + Levenshtein → `Person.name: ["Tom Hooper", "Hooper Atchley", …,
+     "Tobe Hooper", …]` and `Movie.name: ["Hooper", "Looper", …]`.
+   - **cheaply grounded**: the *Movie.name* candidate `"Hooper"` normalized is a
+     substring of `"tmohooper"` (`_cheap_grounded` checks both directions over
+     ALL routed fields' values) → **escalation AND select judge are both
+     skipped** — the multi-candidate evidence goes in as-is.
+   - "direct" (relation) → patterns `(:Movie)-[:directedBy]->(:Person)` and
+     `(:Movie)-[:writtenBy]->(:Person)` (top-2 routed relation tools).
+3. **GENERATE** injection (mention-grouped, best-first — NOT filtered to one):
+   `- "Tmo Hooper" → Person.name: "Tom Hooper" | "Hooper Atchley" | …`
+   `- "Tmo Hooper" → Movie.name: "Hooper" | "Looper" | …`
+   `- "direct"     → relationship pattern: (:Movie)-[:directedBy]->(:Person)`.
+4. The Cypher LLM does the final value-linking ("use at most one value per
+   mention") → `MATCH (m:Movie)-[:directedBy]->(p:Person {name:"Tom Hooper"})
+   RETURN count(m)`, executes, semantic verdict `accept`.
+5. value-snap: `"Tom Hooper"` exists → existence gate skips it. Done.
+
+Had the LLM copied `"Tmo Hooper"` into the `WHERE`, **value-snap** would have
+caught it: the value doesn't exist → closed-list pick → substitute → re-execute.
+
+### 11b. Alias — select judge fires
+
+*"… movies that have received the **Satellite Best Score** …"* (LLM-sourced
+alias of *Satellite Award for Best Original Score*): retrieval surfaces the
+canonical `Award.name` value (token overlap, no containment → NOT cheaply
+grounded) → the select judge fires, `select`s the canonical value → evidence
+filtered to that single value.
+
+### 11c. Alias — abstain (recall miss degrades safely)
+
+*"… won the **BSFC Best Supporting Actor** …"*: the canonical value (*Boston
+Society of Film Critics Award for Best Supporting Actor*) is never retrieved in
+any escalation round; facing a candidate list of *other* awards, the judge
+`abstain`s → evidence suppressed → the Cypher LLM free-generates the predicate.
+No wrong award is ever injected.
+
+> History note: an earlier version of this example claimed the select judge
+> fires on "Tmo Hooper" and filters the evidence to a single value. That was
+> wrong for the shipped config — the `Movie.name` candidate `"Hooper"` makes
+> the mention cheaply grounded, skipping both judges (verified by live trace).

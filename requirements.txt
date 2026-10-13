@@ -1,0 +1,142 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# requirements.txt
+# Curated list (same packages as before); versions pinned to the environment the
+# reference runs used — pip freeze 2026-09-09, Python 3.12.11, macOS arm64.
+# torch / faiss wheels are platform-specific: on Linux or CUDA pip resolves the
+# matching build of the same version.
+# ──────────────────────────────────────────────────────────────────────────────
+
+# ── Core runtime ──────────────────────────────────────────────────────────────
+python-dotenv==1.2.2
+httpx==0.28.1
+requests==2.33.1
+typing_extensions==4.15.0
+loguru==0.7.3
+
+# ── Pydantic ──────────────────────────────────────────────────────────────────
+pydantic==2.13.3
+pydantic-core==2.46.3
+pydantic-settings==2.14.0
+annotated-types==0.7.0
+
+# ── LangChain stack ───────────────────────────────────────────────────────────
+langchain==0.3.28
+langchain-core==0.3.84
+langchain-openai==0.3.35
+langchain-community==0.3.31
+langchain-text-splitters==0.3.11
+
+# ── LangGraph ─────────────────────────────────────────────────────────────────
+langgraph==0.3.34
+langgraph-prebuilt==0.1.8
+langgraph-checkpoint==2.1.2
+langgraph-sdk==0.1.74
+
+# ── LangSmith (tracing) ───────────────────────────────────────────────────────
+langsmith==0.7.33
+
+# ── Neo4j ─────────────────────────────────────────────────────────────────────
+# Native vector indexes require Neo4j >= 5.18 (verified at startup by
+# embedding_helper.check_neo4j_version). The pinned client below works
+# against any 5.x server.
+neo4j==5.28.3
+langchain-neo4j==0.5.0
+# pulled in by langchain-neo4j; pinned so every machine resolves the same build
+# (a fresh install otherwise picks the newest release, 1.18+).
+neo4j-graphrag==1.14.1
+
+# ── OpenAI ────────────────────────────────────────────────────────────────────
+# Used for both chat completions and the default embedding
+# backend (text-embedding-3-small, 1536d) selected by
+# vector_config.EMBEDDING_BACKEND="openai".
+openai==2.32.0
+tiktoken==0.12.0
+
+# ── Embedding backend (OPTIONAL — sentence-transformers / local) ──────────────
+# The OpenAI backend above is the default and is sufficient for paper
+# experiments. Install the entries below ONLY if you set
+# vector_config.EMBEDDING_BACKEND="sentence_transformers" (e.g. for paper
+# reproducibility runs that must avoid closed-source models).
+#
+# These pull in several GB of PyTorch wheels — kept commented so OpenAI
+# users are not forced to install them.
+#
+#   pip install sentence-transformers torch
+#
+# sentence-transformers>=2.7
+# torch>=2.2
+#
+# for cpu
+# pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cpu
+# pip install sentence-transformers==3.3.1
+
+torch==2.5.1
+sentence-transformers==3.3.1
+
+# ── Anthropic (Claude) ───────────────────────────────────────────────────────
+# Pinned to the last 0.2.x release to stay compatible with langchain-core 0.3.x.
+langchain-anthropic==0.2.4
+anthropic==0.97.0
+
+# ── FAISS ─────────────────────────────────────────────────────────────────────
+# CPU build, used by the tool router (tools/tool_search.py) and the FCAV
+# baseline (fcav.py). For CUDA install faiss-gpu instead and drop this line.
+faiss-cpu==1.12.0
+
+# ── Numeric ───────────────────────────────────────────────────────────────────
+numpy==2.4.4
+
+# ── HTTP / async ──────────────────────────────────────────────────────────────
+httpx-sse==0.4.3
+httpcore==1.0.9
+h11==0.16.0
+anyio==4.13.0
+sniffio==1.3.1
+aiohttp==3.13.5
+aiohappyeyeballs==2.6.1
+aiosignal==1.4.0
+frozenlist==1.8.0
+multidict==6.7.1
+yarl==1.23.0
+propcache==0.4.1
+
+# ── Serialisation / data ──────────────────────────────────────────────────────
+orjson==3.11.8
+ormsgpack==1.12.2
+marshmallow==3.26.2
+dataclasses-json==0.6.7
+jsonpatch==1.33
+jsonpointer==3.1.1
+PyYAML==6.0.3
+packaging==25.0
+
+# ── Database ──────────────────────────────────────────────────────────────────
+SQLAlchemy==2.0.49
+
+# ── Data augmentation ─────────────────────────────────────────────────────────
+# Used by data_augmentation/augmenters/typo.py for keyboard-adjacent /
+# random-char-swap typo simulation.  Falls back to a small built-in
+# implementation if nlpaug isn't available.
+nlpaug>=1.1.11
+nltk>=3.8
+
+# ── Misc utilities ────────────────────────────────────────────────────────────
+tenacity==9.1.4
+tqdm==4.67.3
+regex==2026.4.4
+requests-toolbelt==1.0.0
+certifi==2026.4.22
+charset-normalizer==3.4.7
+idna==3.13
+urllib3==2.6.3
+distro==1.9.0
+jiter==0.14.0
+pytz==2026.1.post1
+typing-inspect==0.9.0
+typing-inspection==0.4.2
+mypy_extensions==1.1.0
+attrs==26.1.0
+xxhash==3.6.0
+zstandard==0.25.0
+uuid_utils==0.14.1
+pytest==7.0.0

@@ -1,2 +1,683 @@
-# text2cypher_llm_agent
-Code for anonymous peer review.
+# Text-to-Cypher Agent
+
+A natural-language-to-Cypher pipeline for Neo4j graph databases.  
+Ask questions in plain English → it **grounds** the (possibly perturbed)
+entities to canonical database values, generates Cypher, runs it, and returns a
+human-readable answer.
+
+---
+
+## How it works
+
+```
+User question
+     │
+     ▼
+┌─────────────────────────────────────────────────────┐
+│ 1. Value linking  (ner_agent_auto.py → plan_exec.py)│
+│    • Ground the entities in the question to the      │
+│      canonical DB values the WHERE clause needs      │
+│    • Default = CyANCHOR: decompose the question →    │
+│      route each mention to a field → retrieve        │
+│      (fuzzy ∪ lev ∪ vec) with an LLM corrective loop  │
+│    • Output: candidate canonical values per mention  │
+└──────────────────┬──────────────────────────────────┘
+                   │ candidate canonical values
+                   ▼
+┌─────────────────────────────────────────────────────┐
+│ 2. Cypher generation  (GraphCypherQAChain)          │
+│    • LLM writes Cypher from the graph schema + the   │
+│      candidate values (it does the value-linking)    │
+└──────────────────┬──────────────────────────────────┘
+                   │ Cypher query
+                   ▼
+┌─────────────────────────────────────────────────────┐
+│ 3. Neo4j execution + QA formatting                  │
+│    • Query runs on the live database                │
+│    • LLM formats the rows into a natural-language   │
+│      answer                                         │
+└─────────────────────────────────────────────────────┘
+```
+
+The method is selected by the `METHOD` axis — `no_val_link` · `fcav` · `react` ·
+`graphrag` · `cyanchor` (see [Methods](#value-linking-modes)). The shipped method is
+**CyANCHOR** (`cyanchor`); `No Val Link`, `FCAV`, `ReAct`, and `GraphRAG` are the
+baselines. Ablation: [report/ablation_paper_table.md](report/ablation_paper_table.md).
+
+---
+
+## Prerequisites
+
+| Requirement | Version |
+|---|---|
+| Python | 3.10 – 3.12 |
+| Neo4j | **5.18+** (native vector indexes required for hybrid retrieval; fulltext-only fallback works on 4.4+ if you `--skip-embeddings`) |
+| API keys | `OPENAI_API_KEY` for the default `gpt-5.6-terra` generator and the `text-embedding-3-small` embedding backend; `ANTHROPIC_API_KEY` / `DEEPINFRA_API_KEY` only for those presets (`config.MODEL_PRESETS`) |
+
+---
+
+## Quick Start
+
+> **Running the perturbed-benchmark experiments?** Follow
+> [`docs/RUNNING_EXPERIMENTS.md`](docs/RUNNING_EXPERIMENTS.md) (dataset check,
+> model choice, keys, smoke test, full run, `--publish`).
+> The steps below are for developing the agent itself.
+
+### 1 — Install dependencies
+
+```bash
+git clone <repo-url>
+cd t2c
+
+python -m venv venv
+source venv/bin/activate        # Windows: venv\Scripts\activate
+
+pip install -r requirements.txt
+pip install faiss-cpu            # or faiss-gpu for CUDA
+```
+
+### 2 — Create your `.env` file
+
+Create a `.env` file in the project root:
+
+```dotenv
+# ── Neo4j — for the agent demo / setup against YOUR OWN database. The evaluation
+#    harness ignores these and reads its graph connections from eval_config.py. ──
+NEO4J_URI=bolt://localhost:7687     # or neo4j+s://... for AuraDB
+NEO4J_USERNAME=neo4j
+NEO4J_PASSWORD=your-password
+NEO4J_DATABASE=neo4j                # the database name inside Neo4j
+
+# ── Evaluation graphs (eval_config.GRAPH_CONNS): one Neo4j host, one container per graph ──
+EVAL_NEO4J_HOST=localhost           # host serving the 13 graph containers (ports are listed in eval_config.py)
+EVAL_NEO4J_USERNAME=neo4j
+EVAL_NEO4J_PASSWORD=your-password
+
+# ── LLM API keys (keys only — the model is chosen in eval_config.py / config.py) ──
+OPENAI_API_KEY=sk-...               # always needed: setup + embeddings use OpenAI; generators gpt-5.6-terra, gpt-5.6-luna
+ANTHROPIC_API_KEY=                  # claude-sonnet-5 (only if you run it)
+DEEPINFRA_API_KEY=                  # deepseek-v4.1-flash (only if you run it)
+
+# ── Azure OpenAI (optional — replaces OpenAI when all three are set) ──────────
+AZURE_OPENAI_ENDPOINT=
+AZURE_OPENAI_API_KEY=
+AZURE_OPENAI_DEPLOYMENT=
+AZURE_OPENAI_API_VERSION=2024-05-01-preview
+```
+
+> **AuraDB note:** URI format is `neo4j+s://<id>.databases.neo4j.io`, database name is usually `neo4j`.
+
+> **Embedding model:** not a credential — it lives in `vector_config.py`
+> (`EMBEDDING_MODEL_NAME`, default `text-embedding-3-small`), the single source
+> that setup, FCAV, and the live agent all read. Change it there (not via env),
+> then rebuild the index.
+
+### 3 — Run the one-click setup
+
+```bash
+python setup_project.py
+```
+
+That's it. The script runs all 10 setup steps automatically and prints the status of each one:
+
+```
+══════════════════ Text-to-Cypher Project Setup ══════════════════
+
+──────────────────────────────────────────────────────────────────
+  Step 1 / 10 — Checking environment variables
+──────────────────────────────────────────────────────────────────
+  ✓  NEO4J_URI = bolt://...
+  ✓  NEO4J_DATABASE = 'neo4j'
+  ✓  Embedding backend = 'openai'  (text-embedding-3-small, dim=1536)
+  ✓  LLM credentials found (OpenAI / Azure OpenAI)
+
+──────────────────────────────────────────────────────────────────
+  Step 2 / 10 — Testing Neo4j connection
+──────────────────────────────────────────────────────────────────
+  ✓  Connected to database 'movies'
+  ✓  Node labels found: ['Movie', 'Person']
+  ✓  Neo4j version 5.28.3 (>= 5.18 required)
+
+  ... (steps 3–10) ...
+
+══════════════════════ Setup Complete ════════════════════════════
+
+  Embedding backend  : 'openai' (text-embedding-3-small, dim=1536)
+  Retrieval mode     : 'fuzzy'
+  Vector indexes     :
+                       • vec_idx_node_movie_title
+                       • vec_idx_node_movie_tagline
+                       • vec_idx_node_person_name
+
+  Try a query:
+    python ner_agent_auto.py "Your question here" --verbose
+```
+
+**What each step does:**
+
+| Step | Script called | Output |
+|---|---|---|
+| 1 | *(env check)* | Validates `.env` + reports active embedding backend |
+| 2 | *(Neo4j driver)* | Confirms connection, lists labels, probes Neo4j ≥ 5.18 |
+| 3 | `schema.gen_schema_csv` | `schema_data/schema_nodes.csv`, `schema_data/schema_relations.csv` |
+| 4 | `schema.gen_schema_meta` | `schema_data/schema_meta.json` (LLM-inferred `id_property`, topics, descriptions) |
+| 5 | `neo4j_lib.neo4j_search` | Creates all fulltext indexes in Neo4j |
+| 6 | `embedding.embedding_helper` | Auto-discovers embeddable properties, embeds all distinct values, writes back via `db.create.setNodeVectorProperty` |
+| 7 | `embedding.embedding_helper` | Creates one native vector index per (label, property) entry |
+| 8 | `tools.gen_tools` | `generated/generated_node_tools.py`, `generated/generated_rel_tools.py` |
+| 9 | `schema.gen_system_prompt` | Fresh `agent/prompts.py` (system prompts + schema constants) |
+| 10 | `ner_agent_auto` | `generated/faiss` tool-selection index |
+
+> **Step 4** is what makes the pipeline domain-agnostic. It uses the LLM to analyze the schema CSVs and infer which property identifies each node label (e.g. `title` for Movie, `name` for Person), plus short topic phrases used for NER extraction. This metadata flows into Step 6 (auto-discovery decides which properties get embedded) and Step 8 (so generated tools have accurate descriptions for any database).
+
+**Optional flags:**
+
+```bash
+python setup_project.py --database my_db        # target a specific database
+python setup_project.py --skip-faiss            # skip step 10
+python setup_project.py --skip-embeddings       # skip steps 6 + 7 (legacy fuzzy-only)
+python setup_project.py --rediscover            # re-run embeddable-property discovery
+python setup_project.py --reset-embeddings      # drop + null + re-embed (e.g. after backend swap)
+python setup_project.py --yes                   # non-interactive (CI / scripting)
+python setup_project.py --verbose               # show full tracebacks on errors
+```
+
+---
+
+## Value-linking modes
+
+The method is a single `METHOD` axis (plus CyANCHOR's retrieval/tool sub-axes),
+resolved into a `GroundingSpec`. **For eval runs, edit the boxed
+`★ EXPERIMENT PARAMETERS — EDIT THESE ★` block at the top of `eval_config.py`** —
+that one place holds every method/ablation knob, each annotated inline. It is the
+authoritative single surface (`eval_run` propagates it to the workers and it
+overrides any inherited shell env; every report records the exact values used).
+`config.py` holds the resolver, shipped defaults, and the deeper structural knobs
+(LLM per stage, retrieval widths); the standalone `ner_agent_auto.py` CLI reads it
+directly (env-overridable). You never set environment variables in the normal flow.
+
+| axis | values |
+|---|---|
+| `METHOD` | `no_val_link` · `fcav` · `react` · `graphrag` · `cyanchor` |
+| `TOKEN_LEVEL_FUZZY_MATCH` / `RETRIEVAL_VECTOR` / `LEVENSHTEIN_RETRIEVAL` | `0`/`1` each — CyANCHOR's retrieval arms (≥1 on; defaults `1`/`0`/`1`) |
+| `TOOL_TYPE` | `node` · `node_rel`  (ReAct baseline only; shipped `node` — the same node-property tools as CyANCHOR) |
+| `CYANCHOR_TOOL_SCOPE` | `node` · `node_rel`  (CyANCHOR routing scope; shipped `node` — relation tools off) |
+| `ADAPTIVE_SEARCH_CONTROL` / `VALUE_EXISTENCE_GUARD` | `0`/`1` each — CyANCHOR's corrective retrieval loop and its post-generation guard on query literals (shipped `1` / `1`) |
+| `RESULT_AWARE_QUERY_REPAIR` / `CYPHER_REPAIR_MAX_ROUNDS` / `CYPHER_EMPTY_IS_WRONG` | CyANCHOR-only result-level self-correction (shipped `1` / `4` / `0`: a 0-row result is judged by the evaluator like any other result, not treated as a defect by rule) |
+
+Five of these are the paper's names of the ablated components. Each is an alias of a switch,
+and either name can be set: `TOKEN_LEVEL_FUZZY_MATCH` = `RETRIEVAL_FUZZY`,
+`LEVENSHTEIN_RETRIEVAL` = `RETRIEVAL_LEVENSHTEIN`, `ADAPTIVE_SEARCH_CONTROL` = `PLAN_EXEC_ESCALATE`,
+`RESULT_AWARE_QUERY_REPAIR` = `CYPHER_SEMANTIC_REPAIR`, `VALUE_EXISTENCE_GUARD` = `PLAN_EXEC_VALUE_SNAP`.
+A run records the switch name in its `summary.json`, so runs made before and after the aliases
+existed read the same. The table is in [component_names.py](component_names.py) and at the top of
+[docs/CYANCHOR_IMPLEMENTATION.md](docs/CYANCHOR_IMPLEMENTATION.md).
+
+- **`no_val_link`** — grounding bypassed; only schema + question reach the Cypher LLM.
+- **`fcav`** — retrieve-then-generate RAG baseline (embed question → retrieve values
+  from a self-built value index → LLM generates the entity JSON). Build the index
+  with `setup_fcav.py` first.
+- **`react`** — ReAct NER-agent grounder (baseline); fixed fuzzy/BM25 retrieval over
+  the `TOOL_TYPE` tools (shipped `node`: the node-property tools CyANCHOR routes on).
+- **`graphrag`** — Multi-Agent GraphRAG baseline: **no pre-grounding** — generate
+  Cypher → execute → an LLM evaluator classifies (accept / semantic-defect /
+  error-or-empty); on error/empty it extracts the query's labels, property–value
+  pairs and relationships, validates them against the DB, proposes normalized-
+  Levenshtein replacements for invalid values, and regenerates — up to
+  `GRAPHRAG_MAX_ITER` rounds. Knobs: `GRAPHRAG_*` in `config.py`. Writeup:
+  [docs/multi_agent_graphrag.md](docs/multi_agent_graphrag.md).
+- **`cyanchor`** — **CyANCHOR**, the shipped method: decompose the question → route each
+  mention to a field → retrieve candidates with an LLM corrective loop → hand candidates
+  to the Cypher LLM, which generates, executes, and **self-corrects** on the result: a DB
+  error triggers a CoT error-repair, and a successfully-executed but semantically wrong
+  result (an LLM evaluator judges *incorrect / illogical / incomplete*) triggers a
+  **grounding-aware regeneration** — the candidate grounding is kept and the semantic
+  feedback + CoT are added (anti-oscillation: the final query is the first *accepted*
+  attempt, else the first executable one, so repair can only match-or-beat the no-repair
+  result). Knobs: `RESULT_AWARE_QUERY_REPAIR` / `CYPHER_REPAIR_MAX_ROUNDS` /
+  `CYPHER_EMPTY_IS_WRONG` (off as shipped; when on, a 0-row result counts as a defect without
+  asking the evaluator — unsafe on graphs whose correct answers are often empty). Retrieval is the **union of three independently-toggleable arms**:
+  `TOKEN_LEVEL_FUZZY_MATCH` (per-token fuzzy match on the Lucene full-text index, BM25-ranked), `LEVENSHTEIN_RETRIEVAL` (APOC normalized edit-distance — no
+  embeddings, high-ROI), `RETRIEVAL_VECTOR` (in-graph embeddings). Tool scope: `CYANCHOR_TOOL_SCOPE` = `node`
+  (shipped — relation tools off; the ReAct baseline's `TOOL_TYPE` is `node` as well) | `node_rel`.
+  The paper's names of the five ablated components — Adaptive Search Control, Token Level Fuzzy
+  Match, Levenshtein Retrieval, Result Aware Query Repair, Value Existence Guard — are the names
+  of their switches in the panel (see the note under the table above).
+
+To run a given configuration, set it in `eval_config.py` and run `python eval_run.py`
+— e.g. `METHOD = "cyanchor"` with `RETRIEVAL_VECTOR = False`, `CYANCHOR_TOOL_SCOPE = "node"`
+for CyANCHOR `fuzzy+lev` (the shipped configuration), or `METHOD = "graphrag"` for the Multi-Agent GraphRAG
+baseline. The sweep driver (`orchestrate_sweep.py`) sweeps methods by setting
+`cfg.METHOD` in-process — same surface, no env channel.
+
+> Back-compat: the legacy `VAL_LINK_MODE` / `AGENT_TYPE` / `RETRIEVAL_TYPE` axes still
+> resolve in `config.py` (`val_link`+`plan_exec` → `cyanchor`, `hybrid` → `+vector`).
+
+Method writeup: [docs/multi_agent_graphrag.md](docs/multi_agent_graphrag.md) ·
+results: the per-model reports under `report/<model>/` on the `sweep/<model>` branches.
+
+---
+
+## Hybrid retrieval (vector + fuzzy)
+
+Each value-lookup tool corresponds to one `(node_label, property)` pair (e.g. `Movie.title`, `Person.name`). Vector retrieval is available on **node** value-lookup tools while relationship-property and structural-traversal tools stay on the fuzzy code path. The hybrid pipeline is what `RETRIEVAL_TYPE=hybrid` drives; defaults preserve fuzzy behavior bit-identically.
+
+> **Two "vector" switches — don't mix them up.** This section's
+> `TOOL_RETRIEVAL_MODE` (`fuzzy`/`vector`/`hybrid`) is the **ReAct baseline's**
+> per-tool retrieval mode. **CyANCHOR** (the shipped method) instead uses three
+> independent arms, and its vector arm is toggled by **`eval_config.RETRIEVAL_VECTOR`**
+> — *not* `TOOL_RETRIEVAL_MODE`. To run CyANCHOR with embeddings you need all three
+> layers (build → model → arm):
+>
+> 1. **Build** the embeddings into the graph: `python setup_project.py` **without**
+>    `--skip-embeddings` (steps 6–7; needs Neo4j 5.18+). Auto-discovered properties
+>    land in `vector_config.EMBEDDABLE_PROPERTIES`.
+> 2. **Model/backend** *(optional; defaults fine)*: `vector_config.py`
+>    (`EMBEDDING_BACKEND` / `EMBEDDING_MODEL_NAME`) — the only home for the model.
+> 3. **Arm on**: `eval_config.py` → `RETRIEVAL_VECTOR = True` (run lands in
+>    `…__cyanchor_fvl/`).
+>
+> **Prerequisite:** step 3 is a no-op on a graph built with `--skip-embeddings` —
+> the vector arm has no index to search. For the shipped `fuzzy+lev` default,
+> build with `--skip-embeddings` (Neo4j 4.4+ OK) and leave `RETRIEVAL_VECTOR = False`.
+
+### One-command setup on a fresh Neo4j database
+
+```bash
+# Point .env at the new database, then:
+python setup_project.py
+```
+
+The setup auto-discovers which properties to embed (text-typed, name-hint match, or long-enough fallback), prompts you to confirm the list, and writes it into `vector_config.py:EMBEDDABLE_PROPERTIES`. From then on every run reads that curated list — no rediscovery happens unless you pass `--rediscover`.
+
+### Switching retrieval mode (ablation studies)
+
+Edit one line in `vector_config.py`:
+
+```python
+TOOL_RETRIEVAL_MODE = "fuzzy"     # "fuzzy" | "vector" | "hybrid"
+```
+
+| Mode | Path |
+|---|---|
+| `fuzzy` | Legacy Lucene fulltext (default; bit-identical to pre-hybrid behavior) |
+| `vector` | Embed query → `db.index.vector.queryNodes` → top `HYBRID_FINAL_TOP_K` |
+| `hybrid` | Run both, fuse via `HYBRID_STRATEGY` (`cascade` default — fuzzy-first, vector fills the tail; `rrf` / `weighted` available). On the perturbed benchmark `cascade` is strictly ≥ `fuzzy` and avoids RRF's "semantic-neighbour displaces the exact match" failure. |
+
+**No regeneration of `generated_*_tools.py` is needed** — the node value-lookup tools read `TOOL_RETRIEVAL_MODE` at call time. Just edit the config and re-run:
+
+```bash
+python ner_agent_auto.py "Who directed Memento?" --verbose
+```
+
+### Swapping embedding backends
+
+Two backends ship in `vector_config.py`:
+
+| Backend | Model | Dim | When to use |
+|---|---|---|---|
+| `openai` (default) | `text-embedding-3-small` | 1536 | Cheap, fast, no local GPU needed |
+| `sentence_transformers` | `BAAI/bge-base-en-v1.5` | 768 | Open-source; required for paper reproducibility runs |
+
+Switch by editing one line:
+
+```python
+EMBEDDING_BACKEND = "sentence_transformers"
+```
+
+If the new backend has a different dimension (1536 → 768), you must rebuild the embeddings AND drop the old vector indexes:
+
+```bash
+pip install sentence-transformers torch    # install the optional backend
+python setup_project.py --reset-embeddings
+```
+
+The OpenAI path requires no extra installs — it reuses the `openai` package already pinned in `requirements.txt`.
+
+### Switching backend WITHOUT re-generating tools / system prompt / FAISS
+
+Already ran `setup_project.py` once and only want to swap the embedding backend (e.g. OpenAI ↔ BGE)? Use the dedicated one-click helper — it skips schema regen, tool regen, system-prompt regen, and FAISS rebuild, because those artefacts are independent of which embedding backend powers vector retrieval.
+
+**Procedure (OpenAI → BGE):**
+
+```bash
+# 1. Install the open-source backend if you haven't
+pip install sentence-transformers torch
+```
+
+```python
+# 2. Edit vector_config.py — change ONE line
+EMBEDDING_BACKEND = "sentence_transformers"
+```
+
+```bash
+# 3. Run the one-click swap
+python switch_embedding_backend.py
+```
+
+**Procedure (BGE → OpenAI):**
+
+```python
+# 1. Edit vector_config.py — change ONE line
+EMBEDDING_BACKEND = "openai"
+```
+
+```bash
+# 2. Run the one-click swap
+python switch_embedding_backend.py
+```
+
+(No `pip install` needed for this direction — the `openai` package is already in `requirements.txt`.)
+
+**What the script does (5 steps, fully automated):**
+
+1. Reads `EMBEDDING_BACKEND` / model / dim from `vector_config.py`
+2. Pre-flight checks (deps installed, Neo4j env vars, live dim probe via `verify_backend()`)
+3. Drops the old vector indexes + clears the old embedding properties
+4. Re-embeds every distinct value with the new backend
+5. Recreates vector indexes at the new dim
+
+`generated/generated_node_tools.py`, `generated/generated_rel_tools.py`, `config.py`, `agent/prompts.py`, and `generated/faiss` are intentionally NOT touched.
+
+**Flags:**
+
+```bash
+python switch_embedding_backend.py --yes          # skip confirmation prompt
+python switch_embedding_backend.py --database X   # override NEO4J_DATABASE
+```
+
+**Verify the swap:**
+
+```bash
+python -c "import vector_config as vc; \
+print(vc.EMBEDDING_BACKEND, vc.EMBEDDING_MODEL_NAME, vc.EMBEDDING_DIMENSIONS)"
+# → sentence_transformers BAAI/bge-base-en-v1.5 768
+
+python ner_agent_auto.py "Who directed Memento?" --verbose
+# t2c.retrieval log line should show vector_top5=[...] populated.
+```
+
+### Reading tool-call logs (paper error analysis)
+
+Every value-lookup call emits a structured line on the `t2c.retrieval` logger, including the query, the active mode, the top-5 fuzzy candidates with scores, the top-5 vector candidates with scores, and the final fused result:
+
+```
+[t2c.retrieval] query='matrix' label=Movie prop=title mode=hybrid
+                fuzzy_top5=[{'value': 'The Matrix', 'score': 4.8123}, ...]
+                vector_top5=[{'value': 'The Matrix Revolutions', 'score': 0.9132}, ...]
+                final=['The Matrix', 'The Matrix Reloaded', 'The Matrix Revolutions', ...]
+```
+
+To capture the trace into a file:
+
+```python
+import logging
+logging.getLogger("t2c.retrieval").setLevel(logging.INFO)
+logging.getLogger("t2c.retrieval").addHandler(logging.FileHandler("retrieval.log"))
+```
+
+To silence it during interactive use:
+
+```python
+logging.getLogger("t2c.retrieval").setLevel(logging.WARNING)
+```
+
+### Standalone backfill (without rebuilding the graph)
+
+Use this when you already ran `setup_project.py` once and just need to rebuild embeddings (e.g. after swapping backends, or after Neo4j data changes):
+
+```bash
+python setup_project.py --skip-faiss --reset-embeddings
+```
+
+Or call the helpers directly from Python:
+
+```python
+from neo4j import GraphDatabase
+from embedding.embedding_helper import (
+    backfill_embeddings, create_vector_indexes, verify_backend,
+)
+import vector_config as vc, os
+
+verify_backend()                           # dim sanity check
+driver = GraphDatabase.driver(
+    os.environ["NEO4J_URI"],
+    auth=(os.environ["NEO4J_USERNAME"], os.environ["NEO4J_PASSWORD"]),
+)
+db = os.environ.get("NEO4J_DATABASE", "neo4j")
+backfill_embeddings(driver, db, vc.EMBEDDABLE_PROPERTIES)
+create_vector_indexes(driver, db, vc.EMBEDDABLE_PROPERTIES)
+driver.close()
+```
+
+### 4 — Ask a question
+
+`--mode` selects the method by its canonical name (or set `METHOD` + the retrieval
+switches — see [Methods](#value-linking-modes)).
+
+**CyANCHOR** — the shipped method:
+
+```bash
+# Full pipeline: value linking → Cypher → Neo4j → answer
+python ner_agent_auto.py "Who acted in The Matrix?" --mode cyanchor_fl_node_only
+
+# --verbose shows the intermediate steps:
+#   PLAN     entity mentions decomposed from the question
+#   EXECUTE  per-mention field routing, retrieved candidates, and the
+#            LLM corrective-loop decisions (done / deepen / pick a field)
+#   GENERATE the candidate block + the generated Cypher
+python ner_agent_auto.py "How many movies were released before 2000?" \
+    --mode cyanchor_fl_node_only --verbose
+```
+
+> Canonical names encode the arms and the tool scope: `cyanchor_fl_node_only` =
+> fuzzy+lev over node-property tools only (the shipped configuration, no embeddings);
+> `cyanchor_fvl_node_only` = fuzzy+lev+vector (needs an in-graph vector index;
+> falls back gracefully if absent). A `_node_rel` suffix adds the relation tools —
+> not shipped, ablated to zero. Or just set `METHOD=cyanchor` + the
+> `RETRIEVAL_*` switches and omit `--mode`.
+
+**ReAct** agent — baseline (also shows its agent trace under `--verbose`):
+
+```bash
+python ner_agent_auto.py "How many movies were released before 2000?" \
+    --mode react_node_only --verbose
+
+# Grounding step only (skip Cypher generation)
+python ner_agent_auto.py "movies by Tom Hanks" --mode react_node_only --ner-only
+```
+
+Or call from Python:
+
+```python
+from ner_agent_auto import ask_auto
+
+result = ask_auto("What movies did Keanu Reeves star in?",
+                  mode="cyanchor_fl_node_only")   # or omit to use the config axes
+print(result["cypher"])   # the generated Cypher query
+print(result["result"])   # natural-language answer
+print(result["context"])  # raw rows returned by Neo4j
+```
+
+---
+
+## Testing
+
+### Fulltext search deduplication test
+
+`tests/test_neo4j_search.py` verifies that the fulltext search functions return **unique property values** (no duplicates), ranked by the best matching score.
+
+```bash
+python -m tests.test_neo4j_search
+```
+
+The script runs 5 test cases:
+
+| # | Test | What it checks |
+|---|---|---|
+| 1 | `top_similar_values` — Movie.title | No duplicate values, descending scores, no nulls, k limit |
+| 2 | `top_similar_values` — Person.name | Same checks on a different node label |
+| 3 | `search_tool` — Movie.title | Returns `list[str]` with no duplicates |
+| 4 | `top_similar_rel_values` — ACTED_IN.roles | No duplicate values, descending scores, no nulls, k limit |
+| 5 | `search_rel_tool` — REVIEWED.summary | Returns `list[str]` with no duplicates |
+
+Example output:
+
+```
+─── Test: top_similar_values (Movie.title) ───
+  Query: 'The Matrix' | Label: Movie | Property: title | k=10
+     1. The Matrix  (score=2.5390)
+     2. The Matrix Reloaded  (score=1.4138)
+     3. The Matrix Revolutions  (score=1.4138)
+  [PASS] No duplicate values  (3 results)
+  [PASS] Scores in descending order
+  [PASS] No None values
+  [PASS] Result count (3) <= k (10)
+
+==================================================
+Results: 5 passed, 0 failed, 5 total
+==================================================
+```
+
+> **Note:** Requires a running Neo4j instance with the movies dataset loaded and `.env` configured.
+
+### Evaluation
+
+The repo ships a per-graph evaluation harness over three entity-perturbed
+text-to-Cypher benchmarks — CypherBench, Mind-the-Query, ZOGRASCOPE; 13 graphs,
+each in its own Neo4j container — and the five value-linking methods (No Val
+Link, FCAV, ReAct, GraphRAG, CyANCHOR). Every run writes one record per question
+(`logs/runs/…/records.jsonl`), and every table is derived from those records.
+
+- **Running the model sweep** (one generator model at a time):
+  `python orchestrate_sweep.py` runs the suite, checks it for completeness and
+  publishes it as a branch ([`docs/RUNNING_EXPERIMENTS.md`](docs/RUNNING_EXPERIMENTS.md)).
+- **How the harness works, its knobs, developer runs on a single pair,
+  publishing the artifact set:**
+  [`docs/RUNNING_EXPERIMENTS.md`](docs/RUNNING_EXPERIMENTS.md).
+
+#### Metrics & normalisation
+
+Each per-dataset metric module under `eval/` computes the headline numbers; for CypherBench-style datasets the harness records **Execution Accuracy (EA, multiset)** and **Execution Match (EM, ordered)** per example, and reports EA and PSJS (EM is kept in `records.jsonl` for completeness but is not printed — on perturbed questions it is near zero by construction). Result-set comparison is delegated to `eval/cypher_eval_normalize.py:normalize_result_set`, which structurally expands `Node` / `Relationship` / `Path` cells (label-set + property-set, **never** `element_id`), rounds floats to a configurable epsilon (default `1e-6`), and sorts `collect()`-style list cells unless the gold query has a top-level `ORDER BY`. EA stays multiset and EM stays ordered in both modes — the `ORDER BY` heuristic only governs `sort_collections` inside `collect()` cells, so the EA−EM gap remains a meaningful "fraction of items where ordering matters" signal.
+
+**Every row of the prediction is scored.** Each method hands the evaluator the rows its final query returned. No Val Link and FCAV end in LangChain's `GraphCypherQAChain`, which keeps only the first `top_k` (10) rows for its answer prompt; `ask_auto` therefore executes the chain's query once more, uncapped, with the evaluation executor (`eval.metrics_CypherBench.execute_cypher`, the one ReAct and CyANCHOR use, same timeout), and the evaluators score that complete result (`eval/full_rows.py`). Records written this way carry `rows_rule`. Runs of those two methods made before the fix scored the first 10 rows, so a correct query with a larger result counted as wrong; `orchestrate_sweep.py` marks such cells ↻ and re-scores them itself at the end of a run and before `--publish` (`scripts/rejudge_full_rows.py`, which can also be run on its own: no model call, old verdict kept as `ea_capped`). PSJS was not affected (it re-executes the query), except where it falls back on the EA verdict; the script recomputes it there.
+
+**Gold queries that return a whole node.** 518 ZOGRASCOPE (pole) and 5 Mind-the-Query (bloom) gold queries end in `RETURN x0` — the node itself; CypherBench has none. The systems under test answer "which / who / list" questions with a scalar property, and in the comparison above a property is never equal to a node, so such a prediction counted as wrong whatever it selected. The two scorers therefore apply the node-set rule (`eval/node_set_match.py`): when the value comparison fails on such a gold query and the prediction returns the node or properties of one node variable, the prediction is executed again with its `RETURN` clause projected onto that variable (`RETURN DISTINCT v`; a prediction that limits its result keeps its own `ORDER BY … LIMIT`), and it is correct iff it selects exactly the gold nodes. A prediction that returns an aggregate, an expression, or columns of two variables keeps the value verdict, and the rule never turns a correct answer into a wrong one. Every record carries both verdicts — `ea` (final) and `ea_strict` (the value comparison alone) — and `SWEEP.md` prints the pooled EA under both. A run made before the rule existed is corrected from its stored predictions, without calling a model, by `python scripts/rejudge_node_returns.py`; until then `orchestrate_sweep.py --status` marks its cells ↻ and `--publish` refuses them.
+
+Offline unit tests for the normaliser:
+
+```bash
+python -m pytest tests/test_cypher_eval_normalize.py
+```
+
+---
+
+## Re-running after a schema change
+
+If your Neo4j database schema changes (new labels, properties, or relationships added), just re-run the setup script:
+
+```bash
+python setup_project.py
+```
+
+Or run only the affected steps manually:
+
+```bash
+python -m schema.gen_schema_csv                 # re-export schema CSVs
+python -m schema.gen_schema_meta                # re-infer schema metadata (LLM)
+python -m tools.gen_tools                       # regenerate @tool functions
+python -m schema.gen_system_prompt              # regenerate agent/prompts.py
+python ner_agent_auto.py --rebuild "test"       # rebuild the FAISS index
+```
+
+> **Hand-edited `schema_data/schema_meta.json`?** (e.g. to fix a wrong
+> `id_property` or a topic.) It is **re-inferred by the LLM and overwritten** by
+> both `schema.gen_schema_meta` and a full `setup_project.py`. After editing it
+> by hand, re-run **only the downstream steps that consume it** —
+> `tools.gen_tools` → `schema.gen_system_prompt` → FAISS rebuild — and do **not**
+> re-run `schema.gen_schema_meta` or the full `setup_project.py`, or your edits
+> are clobbered.
+
+---
+
+## Advanced: manual step-by-step setup
+
+If you prefer to run each step individually or need to debug a specific stage:
+
+| # | Command | What it does |
+|---|---|---|
+| 1 | `python -m neo4j_lib.neo4j_diag` | Verify connection and list node labels |
+| 2 | `python -m schema.gen_schema_csv --print-summary` | Export schema to CSV and print a summary |
+| 3 | `python -m schema.gen_schema_meta --verbose` | Infer `id_property`, topics, descriptions via LLM |
+| 4 | *(fulltext indexes — handled by setup_project.py)* | Create all Neo4j fulltext indexes |
+| 5 | `python -m tools.gen_tools` | Generate `@tool` functions from the live schema |
+| 6 | `python -m schema.gen_system_prompt` | Generate `agent/prompts.py` from scratch |
+| 7 | `python ner_agent_auto.py --rebuild "test"` | Build the FAISS tool-selection index |
+
+> **Tip:** Verify fulltext indexes in the Neo4j Browser with  
+> `SHOW FULLTEXT INDEXES YIELD name, state`  
+> All states should be `ONLINE` before running queries.
+
+---
+
+## Project file overview
+
+| File | Purpose |
+|---|---|
+| `.env` | Credentials — **never commit this file** |
+| `requirements.txt` | Python dependencies |
+| `setup_project.py` | **One-click setup** — runs all 10 setup steps automatically |
+| `switch_embedding_backend.py` | **One-click backend swap** — re-embeds + rebuilds vector indexes after editing `EMBEDDING_BACKEND` in `vector_config.py`; does NOT regenerate tools / system prompt / FAISS |
+| `config.py` | **User-managed** runtime settings — LLM configs per stage, sampling/validation knobs, and the **resolver + shipped defaults** for the `METHOD` axis + CyANCHOR's `RETRIEVAL_FUZZY`/`RETRIEVAL_VECTOR`/`RETRIEVAL_LEVENSHTEIN`/`TOOL_TYPE`. **For eval runs these are set in `eval_config.py`** (the authoritative surface); `config.py` supplies the standalone-agent default. Not auto-generated; safe to edit by hand |
+| `component_names.py` | The paper's names of the five ablated CyANCHOR components, as aliases of their switches (panel, environment, ablation cells) and as the names the ablation reports print |
+| `orchestrate_sweep.py` | **Sweep driver** — one generator model over the 13 × 5 suite: resume, completeness verdict, reports, `--publish` (see `docs/RUNNING_EXPERIMENTS.md`) |
+| `eval_run.py` | Evaluates `eval_config.EVAL_PAIRS` with `eval_config.METHOD`, one worker per pair — called by the driver per cell; used directly only for development runs |
+| `eval_aggregate.py` | Development table over everything under `OUT_DIR` — never a deliverable |
+| `eval_config.py` | **The eval run config** (authoritative) — `GRAPH_CONNS`, `EVAL_PAIRS`, `METHOD` + the CyANCHOR arms, `LIMIT`, `SHARDS`, `OUT_DIR`. Committed (the eval Neo4j connection is public for reviewers) |
+| `vector_config.py` | Embedding **backend + model + dim**, ReAct retrieval mode (`TOOL_RETRIEVAL_MODE`: `fuzzy`/`vector`/`hybrid`), hybrid params, `EMBEDDABLE_PROPERTIES`. The single home for the embedding model — never an env var |
+| `paths.py` | Centralized filesystem-layout constants for every generated artifact |
+| `ner_agent_auto.py` | Value-linking → Cypher pipeline (main entrypoint); `ask_auto` dispatches to the grounding mode and runs `GraphCypherQAChain` |
+| `plan_exec.py` | **CyANCHOR** grounder (the shipped method, `METHOD=cyanchor`): decompose → route → retrieve (3 toggleable arms: fuzzy / Levenshtein / vector) with the LLM corrective loop |
+| `fcav.py` | `fcav` mode — retrieve-then-generate RAG baseline over a self-built value index (built by `setup_fcav.py`) |
+| `agent/prompts.py` | **Auto-generated** system prompts (`NER_SP`, `TEXT2CYPHER_SP`, `QA_SP`, `PROMPT_ALIGNER_SP`) + schema constants |
+| `schema/gen_schema_csv.py` | Export full schema to `schema_data/schema_nodes.csv` + `schema_relations.csv` |
+| `schema/gen_schema_meta.py` | LLM-infer `id_property`, topics, descriptions → `schema_data/schema_meta.json` |
+| `schema/gen_system_prompt.py` | Generate `agent/prompts.py` from the live schema |
+| `tools/gen_tools.py` | Generate `@tool` functions from the live schema + `schema_meta.json` |
+| `tools/tool_search.py` | FAISS-based tool search engine |
+| `neo4j_lib/neo4j_search.py` | Fulltext index management + `search_tool()` / `search_rel_tool()` |
+| `neo4j_lib/neo4j_diag.py` | Connection diagnostics (run with `python -m neo4j_lib.neo4j_diag`) |
+| `embedding/embedding_helper.py` | Embeddable-property discovery, backfill, vector-index creation |
+| `generated/generated_node_tools.py` | **Auto-generated** node property search tools |
+| `generated/generated_rel_tools.py` | **Auto-generated** relationship search tools |
+| `generated/faiss/` | **Auto-generated** FAISS tool-selection index (gitignored) |
+| `schema_data/schema_nodes.csv` | **Auto-generated** node schema export |
+| `schema_data/schema_relations.csv` | **Auto-generated** relationship schema export |
+| `schema_data/schema_meta.json` | **Auto-generated** LLM-inferred schema metadata |
+| `tests/test_neo4j_search.py` | Tests for fulltext search deduplication + score ordering |
+
+---
+
+## Troubleshooting
+
+**Connection refused / DNS error**  
+→ Check `NEO4J_URI` in `.env`. For local Neo4j use `bolt://localhost:7687`. For AuraDB use `neo4j+s://`.
+
+**`No module named 'generated_node_tools'`**  
+→ Run `python setup_project.py` or `python -m tools.gen_tools` first.
+
+**`Missing required env var: OPENAI_API_KEY`**  
+→ Make sure `.env` exists in the project root and all required keys are set.
+
+**Fulltext index search returns no results**  
+→ Check that indexes are `ONLINE` in the Neo4j Browser.  
+→ Re-run `python setup_project.py` to rebuild the fulltext indexes.
+
+**FAISS index stale after schema change**  
+→ Re-run `python setup_project.py` or `python ner_agent_auto.py --rebuild "test"`.
+
+**VM external IP changed after reboot**  
+→ Set `EVAL_NEO4J_HOST` (and `EVAL_NEO4J_USERNAME` / `EVAL_NEO4J_PASSWORD`) to the current address of the Neo4j host; the per-graph ports are in `eval_config.py`.
+
+**`SyntaxError` in `generated/generated_rel_tools.py`**  
+→ Re-run `python -m tools.gen_tools` — caused by a Neo4j relType formatting artifact, now fixed.
