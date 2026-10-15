@@ -1,4 +1,4 @@
-> **STATUS: DESCOPED (advisor decision, 2026-08).** Gold fixing is NOT being done —
+> **STATUS: DESCOPED (decision, 2026-08).** Gold fixing is NOT being done —
 > scope is annotation-only. This file is kept as a record. The 79 golds remain in
 > the benchmark and score 0 for every method (assumption-free eval). Recommended
 > follow-up is a single datasheet sentence noting them, nothing more.

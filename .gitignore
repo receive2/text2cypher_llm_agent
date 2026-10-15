@@ -1,0 +1,157 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# Ignore everything by default, then whitelist specific file types
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Ignore everything
+*
+
+# But not .gitignore itself
+!.gitignore
+
+# Whitelist .py, .md, .sh, requirements.txt, and Jupyter notebooks
+!*.py
+!*.md
+!*.sh
+!*.ipynb
+!requirements.txt
+!.env.example
+
+# Allow descent into subdirectories so the whitelists above apply recursively
+# (without this, `*` blocks git from visiting subdirs at all)
+!*/
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Directories to always ignore (even if they contain .py/.md files)
+# ──────────────────────────────────────────────────────────────────────────────
+
+__pycache__/
+faiss_tools/
+faiss_tools_auto/
+llmenv/
+t2c/
+not_use_code/
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Other common ignores
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Refactor additions (2026-04-28)
+# ──────────────────────────────────────────────────────────────────────────────
+
+# Python cache
+*.pyc
+.ipynb_checkpoints/
+
+# Runtime data
+schema_data/
+logs/
+
+# Data-augmentation LLM cache (cache/augmenter_paraphrase.jsonl).
+# Note: the broad `*` rule near the top already ignores non-whitelisted
+# files, but we keep this explicit for clarity and to discourage
+# accidentally tracking a large response cache.
+cache/
+
+# Generated artifacts (keep .py files tracked, ignore everything else)
+generated/tool_descriptions.csv
+generated/faiss/
+
+# Backups
+*.bak
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Per-graph eval harness (2026-04-30)
+# ──────────────────────────────────────────────────────────────────────────────
+
+# eval_config.py IS committed: the eval Neo4j connection (host/port/password) is
+# intentionally public — reviewers need it to reproduce the benchmark. Not a secret.
+
+# Live "which (dataset, graph) is currently swapped in" sentinel,
+# written by eval/artifact_swap.py.
+.current_setup
+
+# Per-graph archived setup outputs — large, machine-generated, and
+# tied to private database contents; recreate via scripts/setup_and_archive.py.
+setup_artifacts/
+# Quarantined / stale artifact snapshots (never ship these).
+setup_artifacts.*
+# Conversation/session exports and stray run logs — never commit.
+exported_conversation*
+*.log
+cypherbench/
+datasets/
+# Tracked source package — exempt from the broad datasets/ ignore above.
+!data_augmentation/datasets/
+!data_augmentation/datasets/**
+verification/
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Released perturbed benchmarks (shared with auditors / for reproducibility)
+# ──────────────────────────────────────────────────────────────────────────────
+!benchmarks/
+!benchmarks/**
+
+.early.coverage
+# ──────────────────────────────────────────────────────────────────────────────
+# Ablation reports — always tracked (override the cypherbench/ dir-name ignore
+# above, which otherwise matches report/CypherBench/ on a case-insensitive FS).
+# ──────────────────────────────────────────────────────────────────────────────
+!report/
+!report/**
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Paper working directory (drafts, LaTeX, scaffolds) — not part of the code release
+# ──────────────────────────────────────────────────────────────────────────────
+paper/
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Internal working documents (dev logs, superseded designs, ops scripts) —
+# not part of the reviewer-facing release
+# ──────────────────────────────────────────────────────────────────────────────
+internal/
+
+# dry-run plans from freeze_verified_release.py (regenerable)
+*.preview.csv
+
+# ── Shared per-graph artifacts (docs/EXPERIMENT_HANDOUT.md §3) ────────────────
+# setup_artifacts/ stays ignored EXCEPT the small, model-independent parts of the
+# *_augmented__* archives plus MANIFEST.json (scripts/artifact_manifest.py).
+# The large indexes (generated/fcav, generated/chess) never enter git.
+!setup_artifacts/
+setup_artifacts/*
+!setup_artifacts/MANIFEST.json
+!setup_artifacts/*_augmented__*/
+setup_artifacts/*_augmented__*/*
+setup_artifacts/*__terrorist_attack/
+# mindthequery_augmented__bloom is a symlink to mindthequery_augmented__bloom50 (one graph,
+# two names — see eval_config.GRAPH_CONNS); publish the target's files and the link.
+!setup_artifacts/mindthequery_augmented__bloom
+!setup_artifacts/*_augmented__*/agent/
+!setup_artifacts/*_augmented__*/schema_data/
+!setup_artifacts/*_augmented__*/vector_config.embeddable_properties.snippet
+!setup_artifacts/*_augmented__*/generated/
+setup_artifacts/*_augmented__*/generated/*
+!setup_artifacts/*_augmented__*/generated/generated_node_tools.py
+!setup_artifacts/*_augmented__*/generated/generated_rel_tools.py
+!setup_artifacts/*_augmented__*/generated/tool_descriptions.csv
+!setup_artifacts/*_augmented__*/generated/faiss/
+!setup_artifacts/*_augmented__*/schema_data/**
+!setup_artifacts/*_augmented__*/generated/faiss/**
+
+# The gold-executability record of the released benchmark (scripts/gold_executability.py) ships with the data.
+!audit/gold_executability.json

@@ -681,3 +681,32 @@ If you prefer to run each step individually or need to debug a specific stage:
 
 **`SyntaxError` in `generated/generated_rel_tools.py`**  
 → Re-run `python -m tools.gen_tools` — caused by a Neo4j relType formatting artifact, now fixed.
+
+## Licenses and attribution
+
+This repository releases (i) the CyANCHOR code and (ii) the value-mention-perturbed
+benchmarks CypherBench-VMP, MindTheQuery-VMP and ZOGRASCOPE-VMP. The perturbed
+benchmarks are derivative works of the resources below. For each question we replaced
+one entity mention in the natural-language question with an alternative surface form;
+the underlying graphs, reference Cypher queries and answers are unchanged.
+
+| Resource | Used for | License | Source |
+|---|---|---|---|
+| CypherBench (Feng et al., 2025) | 7 Wikidata-derived graphs, questions, reference queries, Wikidata aliases | Apache License 2.0 | https://github.com/megagonlabs/cypherbench |
+| Mind the Query (Chauhan et al., 2025) | 5 graphs adapted from Neo4j example datasets, questions, reference queries | Apache License 2.0 | https://github.com/endeavorXx/Mind-the-Query |
+| ZOGRASCOPE (Cazzaro et al., 2025) | POLE graph, questions, reference queries | CC BY 4.0 | https://github.com/interact-erc/ZOGRASCOPE |
+| Wikidata | Entity names and aliases in the CypherBench graphs | CC0 1.0 | https://www.wikidata.org |
+| Neo4j graph examples | Underlying example graphs of Mind the Query and ZOGRASCOPE (incl. POLE) | See the respective repositories | https://github.com/neo4j-graph-examples |
+
+**License of this release**
+- Code: Apache License 2.0 (see `LICENSE`).
+- CypherBench-VMP and MindTheQuery-VMP: Apache License 2.0, the license of their source benchmarks.
+- ZOGRASCOPE-VMP: CC BY 4.0, the license of its source benchmark. Attribution: ZOGRASCOPE
+  by Francesco Cazzaro, Justin Kleindienst, Sofia Márquez Gomez and Ariadna Quattoni,
+  licensed under CC BY 4.0 (https://creativecommons.org/licenses/by/4.0/); modified by
+  replacing one entity mention per question.
+
+We do not redistribute the graphs themselves; please obtain them from the source
+repositories above. The benchmarks are intended for research on Text-to-Cypher and
+value linking, consistent with the research purpose of the source benchmarks. Please
+cite the source benchmarks together with this work when using the perturbed data.

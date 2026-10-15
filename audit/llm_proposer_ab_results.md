@@ -65,6 +65,6 @@ matrix → keep the LLM-proposed vs attested provenance ablation and 100% human
 census (the anti-circularity design already covers this); (c) langchain path
 needs the temperature fix if reused.
 
-Decision owner: user + advisor (scope/budget call). Raw run artifacts:
+Raw run artifacts:
 scratchpad `ab_test.py` / `armB_results.json` (session-local; per-call outputs
 cached in `data_augmentation/llm` cache).
